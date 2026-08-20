@@ -2,86 +2,80 @@
   'use strict';
 
   var finished=false;
-  var timer=null;
   var busy=false;
-  var directTried=false;
+  var timer=null;
   var startedAt=Date.now();
-
-  function normalise(text){
-    return String(text||'').replace(/\s+/g,' ').trim().toLowerCase();
-  }
-
-  function actuallyVisible(el){
-    if(!el || !el.isConnected)return false;
-    var node=el;
-    while(node && node.nodeType===1){
-      var s=getComputedStyle(node);
-      if(s.display==='none' || s.visibility==='hidden' || s.opacity==='0')return false;
-      node=node.parentElement;
-    }
-    var r=el.getBoundingClientRect();
-    return r.width>0 && r.height>0;
-  }
-
-  function findLoadButton(){
-    return Array.from(document.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]')).find(function(btn){
-      if(!actuallyVisible(btn) || btn.disabled)return false;
-      var text=normalise(btn.textContent||btn.innerText||btn.value||'');
-      var title=normalise(btn.getAttribute('title')||'');
-      var aria=normalise(btn.getAttribute('aria-label')||'');
-      return text==='load database' || text.indexOf('load database')>=0 || title.indexOf('load database')>=0 || aria.indexOf('load database')>=0;
-    })||null;
-  }
+  var attempts=0;
 
   function stop(){
     finished=true;
     if(timer){clearInterval(timer);timer=null;}
   }
 
-  async function getSessionUser(){
+  function isCloudReady(){
+    try{return typeof cloudReady!=='undefined' && cloudReady===true;}catch(e){return false;}
+  }
+
+  async function sessionUser(){
     try{
       if(typeof currentUser!=='undefined' && currentUser)return currentUser;
     }catch(e){}
     try{
       if(typeof supabaseClient!=='undefined' && supabaseClient && supabaseClient.auth){
-        var result=await supabaseClient.auth.getSession();
-        return result && result.data && result.data.session && result.data.session.user || null;
+        var out=await supabaseClient.auth.getSession();
+        return out && out.data && out.data.session && out.data.session.user || null;
       }
     }catch(e){}
     return null;
   }
 
+  function showTrying(){
+    try{if(typeof setCloudStatus==='function')setCloudStatus('Loading cloud…','saving');}catch(e){}
+  }
+
+  function findManualLoad(){
+    var els=Array.from(document.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"]'));
+    return els.find(function(el){
+      if(el.disabled)return false;
+      var s=getComputedStyle(el);
+      if(s.display==='none'||s.visibility==='hidden')return false;
+      var t=String(el.textContent||el.innerText||el.value||el.getAttribute('aria-label')||el.getAttribute('title')||'').replace(/\s+/g,' ').trim().toLowerCase();
+      return t.indexOf('load database')>=0 || t.indexOf('load cloud')>=0 || t==='load data';
+    })||null;
+  }
+
   async function attempt(){
-    if(finished || busy)return;
+    if(finished||busy)return;
     busy=true;
+    attempts++;
     try{
-      var user=await getSessionUser();
+      if(isCloudReady()){stop();return;}
+
+      var user=await sessionUser();
       if(!user){
         if(Date.now()-startedAt>30000)stop();
         return;
       }
 
-      // Use the app's own cloud loader once the saved login session has been restored.
-      // This is more reliable than clicking the UI before its handlers/data are ready.
-      if(!directTried){
-        directTried=true;
+      showTrying();
+
+      // Let the app's normal initAuth flow have first chance. Only recover if it has not completed.
+      if(attempts>=2 && !isCloudReady()){
         try{
-          if(typeof loadCloudForUser==='function'){
+          if(typeof enterAuthenticatedApp==='function'){
+            await enterAuthenticatedApp(user);
+          }else if(typeof loadCloudForUser==='function'){
             await loadCloudForUser(user);
-            stop();
-            return;
           }
-        }catch(e){
-          // Fall back to the app's visible Load database control below.
-        }
+        }catch(e){}
       }
 
-      var btn=findLoadButton();
+      if(isCloudReady()){stop();return;}
+
+      // Compatibility fallback for any older cached app shell that still exposes a manual loader.
+      var btn=findManualLoad();
       if(btn){
-        btn.click();
-        // Give the app time to finish the load, then stop rather than polling forever.
-        setTimeout(stop,1800);
-        return;
+        try{btn.click();}catch(e){}
       }
 
       if(Date.now()-startedAt>30000)stop();
@@ -91,8 +85,11 @@
   }
 
   function start(){
-    attempt();
-    timer=setInterval(attempt,500);
+    // Give the built-in auth/session restore a moment before recovery kicks in.
+    setTimeout(function(){
+      attempt();
+      if(!finished)timer=setInterval(attempt,1500);
+    },1200);
   }
 
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});
